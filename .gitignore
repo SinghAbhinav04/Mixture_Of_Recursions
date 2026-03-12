@@ -1,0 +1,56 @@
+# ─── Python ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Virtual environments ─────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ─── Model checkpoints & weights ──────────────────
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# ─── Dataset cache ────────────────────────────────
+.cache/
+hf_cache/
+hf_datasets/
+hf_models/
+data/raw/
+*.parquet
+*.arrow
+
+# ─── Logs & runs ──────────────────────────────────
+logs/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# ─── Jupyter / notebooks ──────────────────────────
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# ─── OS junk ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ─── IDE ──────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace

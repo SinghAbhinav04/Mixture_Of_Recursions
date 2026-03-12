@@ -1,0 +1,16 @@
+# Core
+torch>=2.1.0
+tiktoken>=0.7.0
+
+# Optional: large-scale datasets
+datasets>=2.14.0       # HuggingFace datasets (FineWeb-Edu, OpenWebText)
+transformers>=4.40.0   # only needed if using HF tokenizers as alternative
+
+# Optional: training utilities
+tqdm>=4.66.0
+
+# Optional: flash attention (significant speedup on A100/H100)
+# flash-attn>=2.5.0   # pip install flash-attn --no-build-isolation
+
+# Evaluation
+numpy>=1.24.0
