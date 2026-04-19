@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train.py — Abhinav-MoR single training entrypoint.
+train.py — single training entrypoint.
 
 Usage:
     # Quick test on TinyShakespeare (tiny model, ~30 seconds on GPU):
@@ -128,6 +128,18 @@ def main():
     if args.preset:
         model_cfg, mor_cfg, train_cfg = PRESETS[args.preset]()
         print(f"Using preset: {args.preset}")
+
+        # Override preset values with CLI args if specified
+        # (Check sys.argv to see what the user actually passed)
+        cli_args = sys.argv[1:]
+        if "--dataset" in cli_args: train_cfg.dataset = args.dataset
+        if "--max_steps" in cli_args: train_cfg.max_steps = args.max_steps
+        if "--batch_size" in cli_args: train_cfg.batch_size = args.batch_size
+        if "--lr" in cli_args: train_cfg.lr = args.lr
+        if "--precision" in cli_args: train_cfg.precision = args.precision
+        if "--compile" in cli_args: train_cfg.compile = args.compile
+        if "--out_dir" in cli_args: train_cfg.out_dir = args.out_dir
+        if "--device" in cli_args: train_cfg.device = args.device
     else:
         model_cfg = ModelConfig(
             d_model    = args.d_model,
@@ -142,6 +154,7 @@ def main():
             aux_loss_weight  = args.aux_loss_w,
             z_loss_weight    = args.z_loss_w,
             cap_warmup_steps = args.cap_warmup,
+            router_type      = args.router_type,
         )
         mor_cfg = MoRConfig(
             n_recursions = args.n_recursions,
