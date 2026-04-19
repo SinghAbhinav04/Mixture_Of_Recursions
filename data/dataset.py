@@ -18,6 +18,13 @@ from typing import Optional, Tuple
 
 import torch
 
+# Disable HuggingFace progress bars (prevents Kaggle cell crashes)
+try:
+    import datasets
+    datasets.utils.logging.disable_progress_bar()
+except (ImportError, AttributeError):
+    pass
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Tokenizer (global, lazy-loaded)
