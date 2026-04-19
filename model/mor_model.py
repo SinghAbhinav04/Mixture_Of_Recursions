@@ -332,10 +332,34 @@ class MoRForCausalLM(nn.Module):
         return idx
 
     def num_params(self) -> Dict[str, int]:
-        """Count total vs unique (non-shared) parameters."""
-        total  = sum(p.numel() for p in self.parameters())
-        unique = sum(p.numel() for p in set(self.parameters()))
-        return {"total": total, "unique": unique}
+        """
+        Count total vs unique (non-shared) parameters.
+        PyTorch's .parameters() deduplicates by default, so we manually sum
+        across MoR layers to get the 'total' (virtual) param count.
+        """
+        unique_params = set(self.parameters())
+        unique_count = sum(p.numel() for p in unique_params)
+
+        # Start with non-recursing params (embeddings, head, norm)
+        # We find these by taking all params and subtracting the ones in shared_blocks
+        shared_params = set()
+        for b in self.shared_blocks:
+            shared_params.update(b.parameters())
+
+        base_count = sum(p.numel() for p in (unique_params - shared_params))
+
+        # Sum parameters of all blocks used in the virtual path
+        # (Total = Base + N_recursions * params_per_recursion)
+        total_recursion_count = 0
+        for layer in self.mor_layers:
+            # Each MoR layer has its own router + a group of shared blocks
+            layer_total = sum(p.numel() for p in layer.parameters())
+            total_recursion_count += layer_total
+
+        return {
+            "total": base_count + total_recursion_count,
+            "unique": unique_count
+        }
 
     def print_summary(self):
         """Print a human-readable model summary."""

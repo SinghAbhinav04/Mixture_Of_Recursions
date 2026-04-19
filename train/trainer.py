@@ -149,7 +149,14 @@ def train(
     # ── Mixed precision scaler ──
     use_amp   = cfg.precision in ("fp16", "bf16")
     amp_dtype = torch.bfloat16 if cfg.precision == "bf16" else torch.float16
-    scaler    = torch.amp.GradScaler(device_type="cuda", enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
+
+    # Version-compatible GradScaler initialization
+    try:
+        # Modern PyTorch API
+        scaler = torch.amp.GradScaler(device_type="cuda", enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
+    except (TypeError, AttributeError):
+        # Fallback for older PyTorch versions (< 2.3)
+        scaler = torch.cuda.amp.GradScaler(enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
 
     # ── Compile (PyTorch 2.0+) ──
     if cfg.compile:
