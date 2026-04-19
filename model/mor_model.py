@@ -38,6 +38,7 @@ from model.base import TransformerBlock, RMSNorm, CausalTransformer
 from model.sharing import build_routing_table, count_unique_blocks, print_routing_table
 from model.router import ExpertChoiceRouter, TokenChoiceRouter
 from model.mor_layer import ExpertChoiceMoRLayer, TokenChoiceMoRLayer, MoRLayerOutput
+from model.kv_cache import RecursiveKVCache
 from configs.default import ModelConfig, MoRConfig
 
 
@@ -135,7 +136,7 @@ class MoRForCausalLM(nn.Module):
                     temp             = router_cfg.temp,
                     rand_router      = router_cfg.rand_router,
                 )
-                layer = ExpertChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating)
+                layer = ExpertChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
             else:
                 router = TokenChoiceRouter(
                     d_model               = model_cfg.d_model,
@@ -143,7 +144,7 @@ class MoRForCausalLM(nn.Module):
                     z_loss_weight         = router_cfg.z_loss_weight,
                     temp                  = router_cfg.temp,
                 )
-                layer = TokenChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating)
+                layer = TokenChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
 
             self.mor_layers.append(layer)
 
@@ -177,8 +178,10 @@ class MoRForCausalLM(nn.Module):
 
     def forward(
         self,
-        idx:     torch.Tensor,                   # (B, T)
-        targets: Optional[torch.Tensor] = None,  # (B, T)
+        idx:       torch.Tensor,                   # (B, T)
+        targets:   Optional[torch.Tensor] = None,  # (B, T)
+        use_cache: bool = False,
+        kv_cache:  Optional['RecursiveKVCache'] = None,
     ) -> MoRModelOutput:
         """
         Forward pass through the MoR model.
@@ -204,7 +207,13 @@ class MoRForCausalLM(nn.Module):
         all_router_logits: List[torch.Tensor] = []
 
         for r, mor_layer in enumerate(self.mor_layers):
-            layer_out: MoRLayerOutput = mor_layer(x, prev_selected)
+            layer_out: MoRLayerOutput = mor_layer(
+                x, 
+                prev_selected=prev_selected,
+                recursion_idx=r,
+                kv_cache=kv_cache,
+                use_cache=use_cache
+            )
 
             x             = layer_out.hidden_states
             prev_selected = layer_out.selected_tokens
@@ -271,11 +280,21 @@ class MoRForCausalLM(nn.Module):
         self.eval()
         idx = prompt_ids
 
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.model_cfg.max_seq_len:]
+        # ── 1. Init KV Cache ──
+        kv_cache = RecursiveKVCache(
+            n_unique_blocks=len(self.shared_blocks),
+            n_recursions=self.mor_cfg.n_recursions,
+            n_kv_heads=self.model_cfg.n_kv_heads,
+            head_dim=self.model_cfg.d_model // self.model_cfg.n_heads,
+        )
 
-            out    = self(idx_cond)
-            logits = out.logits[:, -1, :]           # (B, vocab_size)
+        # ── 2. Prefill Phase (Full prompt through network) ──
+        idx_cond = idx[:, -self.model_cfg.max_seq_len:]
+        out = self(idx_cond, use_cache=True, kv_cache=kv_cache)
+        logits = out.logits[:, -1, :]
+
+        # ── 3. Generation Loop (only pass new tokens) ──
+        for _ in range(max_new_tokens):
 
             if temperature != 1.0:
                 logits = logits / temperature
@@ -295,6 +314,10 @@ class MoRForCausalLM(nn.Module):
             probs    = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx      = torch.cat([idx, idx_next], dim=1)
+
+            # Optimisation: Next step only passes the newest token
+            out = self(idx_next, use_cache=True, kv_cache=kv_cache)
+            logits = out.logits[:, -1, :]
 
         return idx
 

@@ -149,7 +149,6 @@ class CausalSelfAttention(nn.Module):
         self.n_rep       = n_heads // n_kv_heads          # repetitions for GQA
         self.head_dim    = d_model // n_heads
         self.d_model     = d_model
-        self.scale       = self.head_dim ** -0.5
 
         # Projections — no bias (LLaMA style)
         self.q_proj  = nn.Linear(d_model, n_heads    * self.head_dim, bias=False)
@@ -157,13 +156,10 @@ class CausalSelfAttention(nn.Module):
         self.v_proj  = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.o_proj  = nn.Linear(d_model, d_model,                    bias=False)
 
+        self.dropout   = dropout
         self.attn_drop = nn.Dropout(dropout)
 
         self.rotary = RotaryEmbedding(self.head_dim, max_seq_len, rope_base)
-
-        # Causal mask buffer
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        self.register_buffer("causal_mask", mask.view(1, 1, max_seq_len, max_seq_len))
 
     def forward(
         self,
@@ -193,15 +189,25 @@ class CausalSelfAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        Tk = k.shape[2]
+        # Use PyTorch's optimised SDPA (Flash Attention when available)
+        # For prefill (no cache, T > 1): is_causal=True handles the mask internally
+        # For decode  (with cache, T = 1): no mask needed (single query attends to all past)
+        if past_kv is None and T > 1:
+            # Prefill: pure causal — SDPA builds the mask internally (O(1) memory)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            # Decode (T=1) or cached continuation: no causal mask needed
+            # because a single new token can attend to all cached keys
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
 
-        # Scaled dot-product + causal mask
-        att = (q @ k.transpose(-2, -1)) * self.scale          # (B, nh, T, Tk)
-        att = att.masked_fill(self.causal_mask[:, :, offset:offset+T, :Tk] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-
-        out = att @ v                                           # (B, nh, T, hd)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.o_proj(out), new_kv
 

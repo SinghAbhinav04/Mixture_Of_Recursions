@@ -82,7 +82,6 @@ class RecursiveKVCache:
     Args:
         n_unique_blocks: number of unique shared blocks
         n_recursions:    total recursion steps per forward pass
-        d_model:         hidden dim (for zero-initialising missing entries)
         n_kv_heads:      number of KV heads
         head_dim:        per-head dimension
     """
@@ -109,14 +108,9 @@ class RecursiveKVCache:
         recursion_idx: int,
         new_k:         torch.Tensor,   # (B, n_kv, T_new, head_dim)
         new_v:         torch.Tensor,
-        selected_mask: Optional[torch.Tensor] = None,  # (B, T_total) bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Update the KV cache for (block_idx, recursion_idx).
-
-        If selected_mask is provided, only the selected positions get updated;
-        unselected positions carry forward the KV from the previous recursion
-        or remain zero.
+        Append new K/V entries to the cache for (block_idx, recursion_idx).
 
         Returns the full (B, n_kv, T_total, head_dim) K and V tensors.
         """

@@ -68,18 +68,23 @@ class ExpertChoiceMoRLayer(nn.Module):
         blocks: nn.ModuleList,
         router: ExpertChoiceRouter,
         gating: str = "weighted",
+        block_indices: Optional[List[int]] = None,
     ):
         super().__init__()
         self.blocks  = blocks
         self.router  = router
         self.gating  = gating
+        self.block_indices = block_indices
         self.is_mor  = True
         self.mor_type = "expert"
 
     def forward(
         self,
         x:              torch.Tensor,              # (B, T, d_model) — all positions
-        prev_selected:  Optional[torch.Tensor],    # (B, k_prev, 1) from last recursion
+        prev_selected:  Optional[torch.Tensor] = None, # (B, k_prev, 1) from last recursion
+        recursion_idx:  int = 0,
+        kv_cache:       Optional['RecursiveKVCache'] = None,
+        use_cache:      bool = False,
         **kwargs,
     ) -> MoRLayerOutput:
         B, T, d = x.shape
@@ -104,8 +109,14 @@ class ExpertChoiceMoRLayer(nn.Module):
 
         # ── 4. Process through shared blocks ──
         h = top_k_x
-        for block in self.blocks:
-            h, _ = block(h)                        # (B, k, d)
+        for i, block in enumerate(self.blocks):
+            global_idx = self.block_indices[i] if self.block_indices is not None else i
+            past_kv = kv_cache.get(global_idx, recursion_idx) if use_cache and kv_cache else None
+            
+            h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
+            
+            if use_cache and kv_cache and new_kv is not None:
+                kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
         # ── 5. Apply gating ──
         if self.gating == "weighted":
@@ -147,18 +158,23 @@ class TokenChoiceMoRLayer(nn.Module):
         blocks: nn.ModuleList,
         router: TokenChoiceRouter,
         gating: str = "weighted",
+        block_indices: Optional[List[int]] = None,
     ):
         super().__init__()
         self.blocks   = blocks
         self.router   = router
         self.gating   = gating
+        self.block_indices = block_indices
         self.is_mor   = True
         self.mor_type = "token"
 
     def forward(
         self,
         x:             torch.Tensor,
-        prev_selected: Optional[torch.Tensor],
+        prev_selected: Optional[torch.Tensor] = None,
+        recursion_idx: int = 0,
+        kv_cache:      Optional['RecursiveKVCache'] = None,
+        use_cache:     bool = False,
         **kwargs,
     ) -> MoRLayerOutput:
         B, T, d = x.shape
@@ -180,8 +196,14 @@ class TokenChoiceMoRLayer(nn.Module):
 
         # ── Compute ──
         h = top_k_x
-        for block in self.blocks:
-            h, _ = block(h)
+        for i, block in enumerate(self.blocks):
+            global_idx = self.block_indices[i] if self.block_indices is not None else i
+            past_kv = kv_cache.get(global_idx, recursion_idx) if use_cache and kv_cache else None
+            
+            h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
+            
+            if use_cache and kv_cache and new_kv is not None:
+                kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
         # ── Gate and scatter ──
         h_out   = h * gate_w if self.gating == "weighted" else h
