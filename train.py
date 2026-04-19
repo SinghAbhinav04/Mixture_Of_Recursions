@@ -137,6 +137,7 @@ def main():
         if "--dataset" in cli_args: train_cfg.dataset = args.dataset
         if "--max_steps" in cli_args: train_cfg.max_steps = args.max_steps
         if "--batch_size" in cli_args: train_cfg.batch_size = args.batch_size
+        if "--grad_accum" in cli_args: train_cfg.grad_accum = args.grad_accum
         if "--lr" in cli_args: train_cfg.lr = args.lr
         if "--precision" in cli_args: train_cfg.precision = args.precision
         if "--compile" in cli_args: train_cfg.compile = args.compile
