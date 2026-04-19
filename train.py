@@ -92,6 +92,8 @@ def parse_args():
                    choices=["fp32", "fp16", "bf16"])
     p.add_argument("--compile",      action="store_true",
                    help="torch.compile() the model (PyTorch 2.0+)")
+    p.add_argument("--no_compile",   action="store_true",
+                   help="Force disable torch.compile() (useful for P100/older GPUs)")
     p.add_argument("--seed",         type=int,   default=42)
 
     # --- I/O ---
@@ -138,6 +140,7 @@ def main():
         if "--lr" in cli_args: train_cfg.lr = args.lr
         if "--precision" in cli_args: train_cfg.precision = args.precision
         if "--compile" in cli_args: train_cfg.compile = args.compile
+        if "--no_compile" in cli_args: train_cfg.compile = not args.no_compile
         if "--out_dir" in cli_args: train_cfg.out_dir = args.out_dir
         if "--device" in cli_args: train_cfg.device = args.device
     else:
@@ -173,7 +176,7 @@ def main():
             weight_decay  = args.weight_decay,
             grad_clip     = args.grad_clip,
             precision     = args.precision,
-            compile       = args.compile,
+            compile       = (args.compile and not args.no_compile),
             seed          = args.seed,
             out_dir       = args.out_dir,
             eval_interval = args.eval_interval,
