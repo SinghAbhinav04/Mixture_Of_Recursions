@@ -90,16 +90,19 @@ def _load_hf_dataset(name: str, split: str = "train", max_samples: Optional[int]
     ds_id, ds_config = HF_NAMES[name]
     print(f"Loading {name} from HuggingFace...")
 
+    import itertools
+
     if ds_config:
-        ds = hf_load(ds_id, ds_config, split=split, streaming=False)
+        ds = hf_load(ds_id, ds_config, split=split, streaming=True)
     else:
-        ds = hf_load(ds_id, split=split, streaming=False)
+        ds = hf_load(ds_id, split=split, streaming=True)
 
     if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        ds = itertools.islice(ds, max_samples)
 
     text_col = "text"
-    print(f"Concatenating {len(ds)} samples...")
+    print(f"Streaming samples...")
+    # Materialize the iterator into a single string
     return "\n\n".join(str(row[text_col]) for row in ds)
 
 
