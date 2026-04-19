@@ -54,15 +54,72 @@ class LinearRouter(nn.Module):
 
     Args:
         d_model: hidden dimension
+        out_dim: output dimension (1 for expert-choice, N_r for token-choice)
     """
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, out_dim: int = 1):
         super().__init__()
-        self.linear = nn.Linear(d_model, 1, bias=False)
+        self.linear = nn.Linear(d_model, out_dim, bias=False)
         nn.init.normal_(self.linear.weight, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, d) → logits: (B, T, 1)"""
+        """x: (B, T, d) → logits: (B, T, out_dim)"""
         return self.linear(x)
+
+
+class MLPRouter(nn.Module):
+    """
+    Two-layer MLP router (Reference: model/mor_model/util.py).
+    Better for token-choice routing per paper §4.2.
+
+    Args:
+        d_model: hidden dimension
+        out_dim: output dimension
+    """
+    def __init__(self, d_model: int, out_dim: int = 1):
+        super().__init__()
+        self.linear = nn.Sequential(
+            nn.Linear(d_model, d_model * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model * 2, out_dim, bias=False),
+        )
+        for layer in self.linear:
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class WideMLPRouter(nn.Module):
+    """
+    Wide two-layer MLP router (same architecture as MLPRouter but
+    semantically distinct for config clarity).
+
+    Args:
+        d_model: hidden dimension
+        out_dim: output dimension
+    """
+    def __init__(self, d_model: int, out_dim: int = 1):
+        super().__init__()
+        self.linear = nn.Sequential(
+            nn.Linear(d_model, d_model * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model * 2, out_dim, bias=False),
+        )
+        for layer in self.linear:
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+# Router head registry
+ROUTER_HEAD_TYPES = {
+    "linear":   LinearRouter,
+    "mlp":      MLPRouter,
+    "wide_mlp": WideMLPRouter,
+}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -107,6 +164,7 @@ class ExpertChoiceRouter(nn.Module):
         cap_warmup_steps: int   = 1000,
         temp:             float = 1.0,
         rand_router:      bool  = False,
+        router_type:      str   = "linear",
     ):
         super().__init__()
         self.target_capacity  = target_capacity
@@ -123,10 +181,12 @@ class ExpertChoiceRouter(nn.Module):
         self.bce    = nn.BCEWithLogitsLoss(reduction="sum")
 
         if not rand_router:
-            self.router = LinearRouter(d_model)
+            RouterHead = ROUTER_HEAD_TYPES.get(router_type, LinearRouter)
+            self.router = RouterHead(d_model, out_dim=1)
         if sampling == "aux_router":
             # Separate detached head for generating the BCE target signal
-            self.aux_router = LinearRouter(d_model)
+            RouterHead = ROUTER_HEAD_TYPES.get(router_type, LinearRouter)
+            self.aux_router = RouterHead(d_model, out_dim=1)
 
     @property
     def current_capacity(self) -> float:
@@ -234,9 +294,14 @@ class TokenChoiceRouter(nn.Module):
 
     At recursion step r, only tokens assigned to depth >= r participate.
 
-    The router head projects each token to N_r logits, and softmax gives
-    the gate weights per expert. Balancing loss encourages uniform load
-    across experts.
+    Supports two balancing strategies (matching reference):
+      - 'loss':      gradient-based balancing loss (Σ P_i * f_i)
+      - 'loss_free': learnable router_bias parameter shifts routing
+                     decisions without gradient-based loss
+
+    Also supports balancing warmup: during the first `bal_warmup_steps`,
+    ALL tokens are forced to the deepest expert, giving the router time
+    to learn before making routing decisions.
 
     Args:
         d_model:      hidden dimension
@@ -244,6 +309,9 @@ class TokenChoiceRouter(nn.Module):
         balancing_loss_weight: load-balancing loss weight
         z_loss_weight: z-loss weight
         temp:         temperature for logit scaling
+        router_type:  'linear', 'mlp', or 'wide_mlp'
+        balancing:    'loss' or 'loss_free'
+        bal_warmup_steps: steps during which all tokens route to deepest
     """
     def __init__(
         self,
@@ -252,16 +320,29 @@ class TokenChoiceRouter(nn.Module):
         balancing_loss_weight: float = 0.01,
         z_loss_weight:         float = 1e-3,
         temp:                  float = 1.0,
+        router_type:           str   = "linear",
+        balancing:             str   = "loss",
+        bal_warmup_steps:      int   = 0,
     ):
         super().__init__()
         self.n_recursions          = n_recursions
         self.balancing_loss_weight = balancing_loss_weight
         self.z_loss_weight         = z_loss_weight
         self.temp                  = temp
+        self.balancing             = balancing
+        self.bal_warmup_steps      = bal_warmup_steps
+        self._step                 = 0
 
-        # Projects to N_r expert scores (not 1 like expert-choice)
-        self.router = nn.Linear(d_model, n_recursions, bias=False)
-        nn.init.normal_(self.router.weight, std=0.02)
+        # Router head (projects to N_r expert scores)
+        RouterHead = ROUTER_HEAD_TYPES.get(router_type, LinearRouter)
+        self.router = RouterHead(d_model, out_dim=n_recursions)
+
+        # Loss-free balancing: learnable bias shifts routing decisions
+        if balancing == "loss_free":
+            self.register_parameter(
+                "router_bias",
+                nn.Parameter(torch.zeros(n_recursions), requires_grad=False)
+            )
 
         # Cache: after the first call, store assignments for subsequent steps
         self._assignments: Optional[torch.Tensor] = None   # (B, T) ints in [0, N_r)
@@ -291,21 +372,40 @@ class TokenChoiceRouter(nn.Module):
         """
         B, T, d = x.shape
 
+        if self.training:
+            self._step += 1
+
         # ── First call (recursion_idx == 0): compute assignments ──
         if self._assignments is None or self._assignments.shape[1] != T:
             raw_logits = self.router(x / self.temp)             # (B, T, N_r)
-            gate_scores = F.softmax(raw_logits, dim=-1)         # (B, T, N_r)
-            assignments = gate_scores.argmax(dim=-1)            # (B, T) — depth per token
+            router_probs = F.softmax(raw_logits, dim=-1)        # (B, T, N_r)
+
+            # Apply loss-free bias if enabled
+            if self.balancing == "loss_free" and hasattr(self, "router_bias"):
+                router_probs_biased = router_probs + self.router_bias
+            else:
+                router_probs_biased = router_probs
+
+            # Balancing warmup: force all tokens to deepest expert
+            if self.training and self._step < self.bal_warmup_steps:
+                assignments = torch.ones(B, T, device=x.device, dtype=torch.long) * (self.n_recursions - 1)
+                # Reset bias during warmup
+                if self.balancing == "loss_free" and hasattr(self, "router_bias"):
+                    self.router_bias.data.zero_()
+            else:
+                _, top_expert = torch.topk(router_probs_biased, 1, dim=-1, sorted=False)  # (B, T, 1)
+                assignments = top_expert.squeeze(-1)             # (B, T)
+
+            # Gate weights from the un-biased probs (for weighted gating)
+            gate_scores = torch.gather(router_probs, dim=-1, index=assignments.unsqueeze(-1)).squeeze(-1)  # (B, T)
 
             self._assignments = assignments
-            self._gate_scores = gate_scores
+            self._gate_scores_full = router_probs
+            self._gate_weights = gate_scores                    # (B, T) — weight per token
             self._raw_logits  = raw_logits
 
         # ── Select tokens assigned to depth >= recursion_idx ──
         active_mask = (self._assignments >= recursion_idx)       # (B, T)
-
-        # Get gate weight for the current recursion's expert
-        cur_gate = self._gate_scores[:, :, min(recursion_idx, self.n_recursions - 1)]  # (B, T)
 
         # Convert mask to padded indices
         selected_list = []
@@ -314,8 +414,8 @@ class TokenChoiceRouter(nn.Module):
 
         for b in range(B):
             idx = active_mask[b].nonzero(as_tuple=False).view(-1, 1)   # (k_b, 1)
-            gv  = cur_gate[b][active_mask[b]]                           # (k_b,)
-            # Edge case: no tokens selected (e.g., decode token assigned to shallower depth)
+            gv  = self._gate_weights[b][active_mask[b]]                # (k_b,)
+            # Edge case: no tokens selected (decode token assigned to shallower depth)
             if idx.shape[0] == 0:
                 idx = torch.zeros(1, 1, dtype=torch.long, device=x.device)
                 gv  = torch.zeros(1, device=x.device)
@@ -334,14 +434,19 @@ class TokenChoiceRouter(nn.Module):
         z_loss   = None
 
         if self.training and recursion_idx == 0:
-            # Load-balancing: fraction of tokens per expert should be ~1/N_r
-            # Compute fraction assigned to each expert
-            fracs = torch.zeros(self.n_recursions, device=x.device)
-            for j in range(self.n_recursions):
-                fracs[j] = (self._assignments == j).float().mean()
-            # Balancing loss: sum of (frac_j - 1/N_r)^2
-            target = 1.0 / self.n_recursions
-            aux_loss = self.balancing_loss_weight * ((fracs - target) ** 2).sum()
+            balancing_ratio = torch.bincount(
+                self._assignments.view(-1), minlength=self.n_recursions
+            ).float() / (B * T)
+
+            if self.balancing == "loss":
+                # Reference-matching balancing loss: Σ P_i * f_i
+                P_i = torch.sum(self._gate_scores_full, dim=(0, 1)) / (B * T)  # (N_r,)
+                f_i = self.n_recursions * balancing_ratio
+                aux_loss = self.balancing_loss_weight * (P_i * f_i).sum()
+
+            elif self.balancing == "loss_free":
+                # No gradient loss; router_bias is updated externally
+                aux_loss = None
 
             if self.z_loss_weight > 0:
                 z = torch.logsumexp(self._raw_logits, dim=-1)           # (B, T)

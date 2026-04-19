@@ -135,6 +135,7 @@ class MoRForCausalLM(nn.Module):
                     cap_warmup_steps = router_cfg.cap_warmup_steps,
                     temp             = router_cfg.temp,
                     rand_router      = router_cfg.rand_router,
+                    router_type      = router_cfg.router_type,
                 )
                 layer = ExpertChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
             else:
@@ -144,6 +145,9 @@ class MoRForCausalLM(nn.Module):
                     balancing_loss_weight = router_cfg.aux_loss_weight,
                     z_loss_weight         = router_cfg.z_loss_weight,
                     temp                  = router_cfg.temp,
+                    router_type           = router_cfg.router_type,
+                    balancing             = router_cfg.balancing,
+                    bal_warmup_steps      = router_cfg.bal_warmup_steps,
                 )
                 layer = TokenChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
 

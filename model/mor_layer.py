@@ -118,17 +118,15 @@ class ExpertChoiceMoRLayer(nn.Module):
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
-        # ── 5. Apply gating (paper Eq 2.1) ──
-        # Gate only the transformation delta, NOT the residual.
-        # Block output h already includes internal residual (h = input + attn + ffn),
-        # so delta = h - top_k_x is the pure transformation.
-        delta = h - top_k_x                        # (B, k, d) — non-residual part only
+        # ── 5. Apply gating (matching reference implementation) ──
+        # Gate the full block output, then scatter-add onto identity (total_x).
+        # Effective: total_x = x + gate * block(selected_x)
         if self.gating == "weighted":
-            h_out = delta * gate_w                  # (B, k, d) — gated transformation
+            h_out = h * gate_w                      # (B, k, d) — gated block output
         else:
-            h_out = delta                           # identity gate
+            h_out = h                               # identity gate
 
-        # ── 6. Scatter-add gated delta back into full hidden state ──
+        # ── 6. Scatter-add gated output back into full hidden state ──
         total_x = total_x.scatter_add(1, idx_exp, h_out)   # (B, T, d)
 
         return MoRLayerOutput(
@@ -211,10 +209,8 @@ class TokenChoiceMoRLayer(nn.Module):
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
-        # ── Gate and scatter (paper Eq 2.1) ──
-        # Gate only the transformation delta, not the full residual output
-        delta   = h - top_k_x                       # pure transformation
-        h_out   = delta * gate_w if self.gating == "weighted" else delta
+        # ── Gate and scatter (matching reference implementation) ──
+        h_out   = h * gate_w if self.gating == "weighted" else h
         total_x = total_x.scatter_add(1, idx_exp, h_out)
 
         return MoRLayerOutput(

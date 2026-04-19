@@ -22,8 +22,8 @@ from typing import Literal, Optional
 class RouterConfig:
     """Expert-choice router hyperparameters."""
 
-    # Router type: 'linear' (single projection head)
-    router_type: Literal["linear"] = "linear"
+    # Router type: 'linear' (single projection), 'mlp' or 'wide_mlp'
+    router_type: Literal["linear", "mlp", "wide_mlp"] = "linear"
 
     # Activation applied to router logits before top-k
     router_func: Literal["sigmoid", "tanh"] = "sigmoid"
@@ -57,6 +57,13 @@ class RouterConfig:
     # Warmup steps for capacity: starts at 1.0, decays to target
     # Set 0 to disable warmup and use target capacity from step 0
     cap_warmup_steps: int = 1000
+
+    # Token-choice balancing strategy: 'loss' (gradient) or 'loss_free' (bias adjustment)
+    balancing: Literal["loss", "loss_free"] = "loss"
+
+    # Balancing warmup: force all tokens to max depth for this many steps
+    # (Token-choice only. Gives router time to learn before it starts routing.)
+    bal_warmup_steps: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────
