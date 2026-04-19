@@ -241,8 +241,28 @@ def medium_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
     return model, mor, train
 
 
+def large_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
+    """
+    ~1B effective parameter model with massive 128k context window.
+    WARNING: This will immediately OOM on a standard Kaggle GPU or laptop!
+    """
+    model = ModelConfig(
+        d_model=2048, 
+        n_layers=36,       # 36 virtual layers
+        n_heads=16, 
+        n_kv_heads=8,      # GQA to save some memory
+        max_seq_len=128000,# Massive context window
+        dropout=0.0
+    )
+    mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
+    # Batch size forced to 1 because of the massive context window
+    train = TrainConfig(max_steps=200_000, batch_size=1, grad_accum=128, lr=1e-4, warmup_steps=2000, precision="bf16")
+    return model, mor, train
+
+
 PRESETS = {
-    "tiny":   tiny_config,
-    "small":  small_config,
-    "medium": medium_config,
+    "tiny":     tiny_config,
+    "small":    small_config,
+    "medium":   medium_config,
+    "large":    large_config,
 }

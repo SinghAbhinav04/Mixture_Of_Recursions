@@ -182,6 +182,9 @@ python train.py --preset small --max_steps 20000
 
 # Medium — ~120M unique params, A100/H100 recommended
 python train.py --preset medium --dataset fineweb
+
+# Large — ~1B unique params, 128k context window (Requires massive VRAM!)
+python train.py --preset large --dataset openwebtext
 ```
 
 ### Full manual control
