@@ -187,8 +187,7 @@ At inference, tokens that exit early still need their KV entries available for f
 
 ```bash
 # Clone and enter the project
-git clone https://github.com/SinghAbhinav04/Mixture_Of_Recursions.git abhinav-mor
-cd abhinav-mor
+git clone https://github.com/SinghAbhinav04/Mixture_Of_Recursions.git
 
 # Install core dependencies
 pip install torch tiktoken
