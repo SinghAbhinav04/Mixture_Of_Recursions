@@ -118,13 +118,17 @@ class ExpertChoiceMoRLayer(nn.Module):
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
-        # ── 5. Apply gating ──
+        # ── 5. Apply gating (paper Eq 2.1) ──
+        # Gate only the transformation delta, NOT the residual.
+        # Block output h already includes internal residual (h = input + attn + ffn),
+        # so delta = h - top_k_x is the pure transformation.
+        delta = h - top_k_x                        # (B, k, d) — non-residual part only
         if self.gating == "weighted":
-            h_out = h * gate_w                     # (B, k, d) — element-wise scale
+            h_out = delta * gate_w                  # (B, k, d) — gated transformation
         else:
-            h_out = h                              # identity gate
+            h_out = delta                           # identity gate
 
-        # ── 6. Scatter-add back into full hidden state ──
+        # ── 6. Scatter-add gated delta back into full hidden state ──
         total_x = total_x.scatter_add(1, idx_exp, h_out)   # (B, T, d)
 
         return MoRLayerOutput(
@@ -180,13 +184,15 @@ class TokenChoiceMoRLayer(nn.Module):
         B, T, d = x.shape
         total_x = x
 
-        if prev_selected is not None:
+        if prev_selected is not None and not hasattr(self.router, 'n_recursions'):
+            # Expert-choice: restrict to previously active tokens
             active_x = torch.gather(x, 1, prev_selected.expand(-1, -1, d))
         else:
+            # Token-choice: always use full sequence (router handles assignment)
             active_x = x
 
         # ── Routing ──
-        router_out: RouterOutput = self.router(active_x, prev_selected=prev_selected)
+        router_out: RouterOutput = self.router(active_x, prev_selected=prev_selected, recursion_idx=recursion_idx)
         selected = router_out.selected_tokens    # (B, k, 1)
         gate_w   = router_out.gate_weights       # (B, k, 1)
 
@@ -205,8 +211,10 @@ class TokenChoiceMoRLayer(nn.Module):
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
-        # ── Gate and scatter ──
-        h_out   = h * gate_w if self.gating == "weighted" else h
+        # ── Gate and scatter (paper Eq 2.1) ──
+        # Gate only the transformation delta, not the full residual output
+        delta   = h - top_k_x                       # pure transformation
+        h_out   = delta * gate_w if self.gating == "weighted" else delta
         total_x = total_x.scatter_add(1, idx_exp, h_out)
 
         return MoRLayerOutput(

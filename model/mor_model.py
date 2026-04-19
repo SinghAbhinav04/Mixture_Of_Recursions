@@ -140,6 +140,7 @@ class MoRForCausalLM(nn.Module):
             else:
                 router = TokenChoiceRouter(
                     d_model               = model_cfg.d_model,
+                    n_recursions          = N,
                     balancing_loss_weight = router_cfg.aux_loss_weight,
                     z_loss_weight         = router_cfg.z_loss_weight,
                     temp                  = router_cfg.temp,
@@ -199,6 +200,11 @@ class MoRForCausalLM(nn.Module):
 
         # ── Token embedding ──
         x = self.emb_drop(self.tok_emb(idx))           # (B, T, d_model)
+
+        # ── Reset token-choice router caches (assignments are per-sequence) ──
+        for mor_layer in self.mor_layers:
+            if hasattr(mor_layer.router, 'reset'):
+                mor_layer.router.reset()
 
         # ── MoR recursion loop ──
         prev_selected    = None

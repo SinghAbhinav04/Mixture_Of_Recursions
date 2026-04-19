@@ -227,7 +227,7 @@ def small_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
     """
     model = ModelConfig(d_model=512, n_layers=12, n_heads=8, n_kv_heads=4, max_seq_len=512, dropout=0.0)
     mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
-    train = TrainConfig(max_steps=20_000, batch_size=32, grad_accum=4, lr=2e-4, warmup_steps=500)
+    train = TrainConfig(max_steps=20_000, batch_size=32, grad_accum=4, lr=2e-4, warmup_steps=500, compile=True)
     return model, mor, train
 
 
@@ -237,7 +237,7 @@ def medium_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
     """
     model = ModelConfig(d_model=1024, n_layers=24, n_heads=16, n_kv_heads=8, max_seq_len=2048, dropout=0.0)
     mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
-    train = TrainConfig(max_steps=100_000, batch_size=64, grad_accum=8, lr=1e-4, warmup_steps=2000, precision="bf16")
+    train = TrainConfig(max_steps=100_000, batch_size=64, grad_accum=8, lr=1e-4, warmup_steps=2000, precision="bf16", compile=True)
     return model, mor, train
 
 
@@ -256,7 +256,7 @@ def large_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
     )
     mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
     # Batch size forced to 1 because of the massive context window
-    train = TrainConfig(max_steps=200_000, batch_size=1, grad_accum=128, lr=1e-4, warmup_steps=2000, precision="bf16")
+    train = TrainConfig(max_steps=200_000, batch_size=1, grad_accum=128, lr=1e-4, warmup_steps=2000, precision="bf16", compile=True)
     return model, mor, train
 
 

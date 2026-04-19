@@ -220,70 +220,105 @@ class ExpertChoiceRouter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────
-#  Token-Choice Router
+#  Token-Choice Router (Paper §2.2.1, Eq 2.2)
 # ─────────────────────────────────────────────────────────────────
 
 class TokenChoiceRouter(nn.Module):
     """
-    Token-choice routing — each token decides whether to recurse deeper.
+    Token-choice routing (Paper Eq 2.2) — one-shot assignment.
 
-    Unlike expert-choice, token-choice can produce variable-length active sets.
-    We handle this with padding so that batched computation remains efficient.
+    Unlike expert-choice (where each recursion step picks its own top-k),
+    token-choice commits each token to a FIXED recursion depth at the start.
+    The router runs ONCE after recursion 0, producing per-token scores over
+    N_r experts (recursion depths). Each token is assigned via argmax (top-1).
 
-    The routing decision is a hard threshold on σ(logit) ≥ 0.5,
-    but during training we use soft gates to keep gradients flowing.
+    At recursion step r, only tokens assigned to depth >= r participate.
+
+    The router head projects each token to N_r logits, and softmax gives
+    the gate weights per expert. Balancing loss encourages uniform load
+    across experts.
 
     Args:
-        d_model:         hidden dimension
-        threshold:       sigmoid threshold for binary gating
+        d_model:      hidden dimension
+        n_recursions: number of recursion experts (N_r)
         balancing_loss_weight: load-balancing loss weight
-        z_loss_weight:   z-loss weight
+        z_loss_weight: z-loss weight
+        temp:         temperature for logit scaling
     """
     def __init__(
         self,
-        d_model:                int,
-        threshold:              float = 0.5,
-        balancing_loss_weight:  float = 0.01,
-        z_loss_weight:          float = 1e-3,
-        temp:                   float = 1.0,
+        d_model:               int,
+        n_recursions:          int   = 3,
+        balancing_loss_weight: float = 0.01,
+        z_loss_weight:         float = 1e-3,
+        temp:                  float = 1.0,
     ):
         super().__init__()
-        self.threshold             = threshold
+        self.n_recursions          = n_recursions
         self.balancing_loss_weight = balancing_loss_weight
         self.z_loss_weight         = z_loss_weight
         self.temp                  = temp
 
-        self.router = LinearRouter(d_model)
+        # Projects to N_r expert scores (not 1 like expert-choice)
+        self.router = nn.Linear(d_model, n_recursions, bias=False)
+        nn.init.normal_(self.router.weight, std=0.02)
+
+        # Cache: after the first call, store assignments for subsequent steps
+        self._assignments: Optional[torch.Tensor] = None   # (B, T) ints in [0, N_r)
+        self._gate_scores: Optional[torch.Tensor] = None   # (B, T, N_r) softmax
+        self._raw_logits:  Optional[torch.Tensor] = None   # (B, T, N_r) raw
+
+    def reset(self):
+        """Clear cached assignments (call before each new sequence)."""
+        self._assignments = None
+        self._gate_scores = None
+        self._raw_logits  = None
 
     def forward(
         self,
         x: torch.Tensor,
         prev_selected: Optional[torch.Tensor] = None,
+        recursion_idx: int = 0,
     ) -> RouterOutput:
         """
         Args:
-            x:             (B, T, d_model) — all tokens (or currently active)
-            prev_selected: (B, k_prev, 1)  — active indices from previous step
+            x:              (B, T, d_model) — hidden states after recursion 0
+            prev_selected:  unused for token-choice (kept for API compat)
+            recursion_idx:  current recursion step (0-indexed)
 
         Returns:
-            RouterOutput
+            RouterOutput with tokens assigned to depth >= recursion_idx
         """
         B, T, d = x.shape
 
-        raw_logits  = self.router(x / self.temp)           # (B, T, 1)
-        gate_values = torch.sigmoid(raw_logits)             # (B, T, 1)
+        # ── First call (recursion_idx == 0): compute assignments ──
+        if self._assignments is None or self._assignments.shape[1] != T:
+            raw_logits = self.router(x / self.temp)             # (B, T, N_r)
+            gate_scores = F.softmax(raw_logits, dim=-1)         # (B, T, N_r)
+            assignments = gate_scores.argmax(dim=-1)            # (B, T) — depth per token
 
-        # Hard selection: tokens where gate > threshold
-        selected_mask = (gate_values.squeeze(-1) >= self.threshold)  # (B, T)
+            self._assignments = assignments
+            self._gate_scores = gate_scores
+            self._raw_logits  = raw_logits
 
-        # Convert mask to indices — pad to max active length
+        # ── Select tokens assigned to depth >= recursion_idx ──
+        active_mask = (self._assignments >= recursion_idx)       # (B, T)
+
+        # Get gate weight for the current recursion's expert
+        cur_gate = self._gate_scores[:, :, min(recursion_idx, self.n_recursions - 1)]  # (B, T)
+
+        # Convert mask to padded indices
         selected_list = []
         gate_list     = []
-        max_k = max(1, selected_mask.sum(dim=-1).max().item())
+        max_k = max(1, int(active_mask.sum(dim=-1).max().item()))
 
         for b in range(B):
-            idx = selected_mask[b].nonzero(as_tuple=False).view(-1, 1)   # (k_b, 1)
-            gv  = gate_values[b][selected_mask[b]]                        # (k_b,)
+            idx = active_mask[b].nonzero(as_tuple=False).view(-1, 1)   # (k_b, 1)
+            gv  = cur_gate[b][active_mask[b]]                           # (k_b,)
+            # Edge case: no tokens selected (e.g., decode token assigned to shallower depth)
+            if idx.shape[0] == 0:
+                idx = torch.zeros(1, 1, dtype=torch.long, device=x.device)
+                gv  = torch.zeros(1, device=x.device)
             pad = max_k - idx.shape[0]
             if pad > 0:
                 idx = torch.cat([idx, idx[-1:].expand(pad, 1)], dim=0)
@@ -291,30 +326,31 @@ class TokenChoiceRouter(nn.Module):
             selected_list.append(idx)
             gate_list.append(gv)
 
-        selected     = torch.stack(selected_list, dim=0).unsqueeze(-1)    # (B, max_k, 1)
-        gate_weights = torch.stack(gate_list, dim=0).unsqueeze(-1)        # (B, max_k, 1)
+        selected     = torch.stack(selected_list, dim=0)                # (B, max_k, 1)
+        gate_weights = torch.stack(gate_list, dim=0).unsqueeze(-1)      # (B, max_k, 1)
 
-        # Map to global indices via prev_selected
-        if prev_selected is not None:
-            selected = torch.gather(prev_selected, dim=1, index=selected)
-
-        # ── Losses ──
+        # ── Losses (only computed once at recursion_idx == 0) ──
         aux_loss = None
         z_loss   = None
 
-        if self.training:
-            # Load-balancing: encourage uniform token distribution across steps
-            mean_gate = gate_values.mean()
-            aux_loss  = self.balancing_loss_weight * mean_gate * (1 - mean_gate)
+        if self.training and recursion_idx == 0:
+            # Load-balancing: fraction of tokens per expert should be ~1/N_r
+            # Compute fraction assigned to each expert
+            fracs = torch.zeros(self.n_recursions, device=x.device)
+            for j in range(self.n_recursions):
+                fracs[j] = (self._assignments == j).float().mean()
+            # Balancing loss: sum of (frac_j - 1/N_r)^2
+            target = 1.0 / self.n_recursions
+            aux_loss = self.balancing_loss_weight * ((fracs - target) ** 2).sum()
 
             if self.z_loss_weight > 0:
-                z = torch.logsumexp(raw_logits.squeeze(-1), dim=-1)
+                z = torch.logsumexp(self._raw_logits, dim=-1)           # (B, T)
                 z_loss = self.z_loss_weight * z.pow(2).mean()
 
         return RouterOutput(
             selected_tokens=selected,
             gate_weights=gate_weights,
-            router_logits=raw_logits,
+            router_logits=self._raw_logits[:, :, :1] if self._raw_logits is not None else x[:, :, :1],
             aux_loss=aux_loss,
             z_loss=z_loss,
         )

@@ -149,7 +149,7 @@ def train(
     # ── Mixed precision scaler ──
     use_amp   = cfg.precision in ("fp16", "bf16")
     amp_dtype = torch.bfloat16 if cfg.precision == "bf16" else torch.float16
-    scaler    = torch.cuda.amp.GradScaler(enabled=(cfg.precision == "fp16"))
+    scaler    = torch.amp.GradScaler(device_type="cuda", enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
 
     # ── Compile (PyTorch 2.0+) ──
     if cfg.compile:
@@ -271,9 +271,9 @@ def train(
                 model_cfg = model.model_cfg,
                 mor_cfg   = model.mor_cfg,
             )
-            # Always keep a symlink/copy as "last.pt"
+            import shutil
             last_path = os.path.join(out_dir, "last.pt")
-            torch.save(torch.load(ckpt_path), last_path)
+            shutil.copy2(ckpt_path, last_path)
 
     print(f"\n✅ Training complete! Model saved to {out_dir}/last.pt")
     return model
