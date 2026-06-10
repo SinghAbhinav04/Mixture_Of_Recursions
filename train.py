@@ -9,12 +9,15 @@ Usage:
     # Using a named preset:
     python train.py --preset small --max_steps 20000
 
+    # Kaggle-optimised (fits T4/P100 16GB):
+    python train.py --preset kaggle_small
+
     # Full fine-grained control:
-    python train.py \\
-        --dataset tiny_shakespeare \\
-        --d_model 512 --n_layers 12 --n_heads 8 --n_kv_heads 4 \\
-        --n_recursions 3 --strategy middle_cycle \\
-        --max_steps 5000 --batch_size 32 --lr 3e-4 \\
+    python train.py \
+        --dataset tiny_shakespeare \
+        --d_model 512 --n_layers 12 --n_heads 8 --n_kv_heads 4 \
+        --n_recursions 3 --strategy middle_cycle \
+        --max_steps 5000 --batch_size 32 --lr 3e-4 \
         --out_dir checkpoints/my_run
 
     # Resume from checkpoint:
@@ -24,7 +27,6 @@ import argparse
 import sys
 import os
 
-# ── make sure imports work when running from project root ──
 sys.path.insert(0, os.path.dirname(__file__))
 
 import torch
@@ -47,7 +49,7 @@ def parse_args():
 
     # --- Preset ---
     p.add_argument("--preset", choices=list(PRESETS), default=None,
-                   help="Named preset config (tiny/small/medium). Overrides individual flags.")
+                   help="Named preset config (tiny/small/kaggle_small/kaggle_medium/medium). Overrides individual flags.")
 
     # --- Dataset ---
     p.add_argument("--dataset", default="tiny_shakespeare",
@@ -94,6 +96,8 @@ def parse_args():
                    help="torch.compile() the model (PyTorch 2.0+)")
     p.add_argument("--no_compile",   action="store_true",
                    help="Force disable torch.compile() (useful for P100/older GPUs)")
+    p.add_argument("--no_grad_ckpt", action="store_true",
+                   help="Disable gradient checkpointing (saves compute, uses more memory)")
     p.add_argument("--seed",         type=int,   default=42)
 
     # --- I/O ---
@@ -131,8 +135,6 @@ def main():
         model_cfg, mor_cfg, train_cfg = PRESETS[args.preset]()
         print(f"Using preset: {args.preset}")
 
-        # Override preset values with CLI args if specified
-        # (Check sys.argv to see what the user actually passed)
         cli_args = sys.argv[1:]
         if "--dataset" in cli_args: train_cfg.dataset = args.dataset
         if "--max_steps" in cli_args: train_cfg.max_steps = args.max_steps
@@ -142,6 +144,7 @@ def main():
         if "--precision" in cli_args: train_cfg.precision = args.precision
         if "--compile" in cli_args: train_cfg.compile = args.compile
         if "--no_compile" in cli_args: train_cfg.compile = not args.no_compile
+        if "--no_grad_ckpt" in cli_args: train_cfg.gradient_checkpointing = not args.no_grad_ckpt
         if "--out_dir" in cli_args: train_cfg.out_dir = args.out_dir
         if "--device" in cli_args: train_cfg.device = args.device
     else:
@@ -168,33 +171,33 @@ def main():
             kv_sharing   = not args.no_kv_sharing,
         )
         train_cfg = TrainConfig(
-            dataset       = args.dataset,
-            max_steps     = args.max_steps,
-            batch_size    = args.batch_size,
-            grad_accum    = args.grad_accum,
-            lr            = args.lr,
-            warmup_steps  = args.warmup_steps,
-            weight_decay  = args.weight_decay,
-            grad_clip     = args.grad_clip,
-            precision     = args.precision,
-            compile       = (args.compile and not args.no_compile),
-            seed          = args.seed,
-            out_dir       = args.out_dir,
-            eval_interval = args.eval_interval,
-            save_interval = args.save_interval,
-            log_interval  = args.log_interval,
-            device        = device,
+            dataset              = args.dataset,
+            max_steps            = args.max_steps,
+            batch_size           = args.batch_size,
+            grad_accum           = args.grad_accum,
+            lr                   = args.lr,
+            warmup_steps         = args.warmup_steps,
+            weight_decay         = args.weight_decay,
+            grad_clip            = args.grad_clip,
+            precision            = args.precision,
+            compile              = (args.compile and not args.no_compile),
+            gradient_checkpointing = not args.no_grad_ckpt,
+            seed                 = args.seed,
+            out_dir              = args.out_dir,
+            eval_interval        = args.eval_interval,
+            save_interval        = args.save_interval,
+            log_interval         = args.log_interval,
+            device               = device,
         )
 
     # ── Build model ──
-    model = MoRForCausalLM(model_cfg, mor_cfg)
+    model = MoRForCausalLM(model_cfg, mor_cfg, gradient_checkpointing=train_cfg.gradient_checkpointing)
     model.print_summary()
 
-    # ── Load data ──
+    # ── Load data (kept on CPU, batches moved in get_batch) ──
     train_data, val_data = get_dataset(
         source      = train_cfg.dataset,
         max_samples = args.max_samples,
-        device      = device,
     )
 
     # ── Train ──

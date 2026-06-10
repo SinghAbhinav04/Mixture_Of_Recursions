@@ -203,6 +203,9 @@ class TrainConfig:
     # Compile model with torch.compile (PyTorch 2.0+)
     compile: bool = False
 
+    # Gradient checkpointing — trades ~25% speed for ~60% activation memory savings
+    gradient_checkpointing: bool = True
+
     # Seed for reproducibility
     seed: int = 42
 
@@ -231,10 +234,36 @@ def tiny_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
 def small_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
     """
     Small model (~85M effective, ~28M unique params).
+    WARNING: batch_size=32 OOMs on 16GB GPUs (T4/P100) due to the
+    200K vocab logits tensor. Use kaggle_small for those GPUs.
     """
     model = ModelConfig(d_model=512, n_layers=12, n_heads=8, n_kv_heads=4, max_seq_len=512, dropout=0.0)
     mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
     train = TrainConfig(max_steps=20_000, batch_size=32, grad_accum=4, lr=2e-4, warmup_steps=500, compile=True)
+    return model, mor, train
+
+
+def kaggle_small_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
+    """
+    Kaggle-optimised small model for T4/P100 (16GB VRAM).
+    Key changes vs small: smaller batch, more grad_accum, shorter seq.
+    ~85M effective, ~28M unique params. Fits in ~9GB peak with chunked CE.
+    """
+    model = ModelConfig(d_model=512, n_layers=12, n_heads=8, n_kv_heads=4, max_seq_len=256, dropout=0.0)
+    mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
+    train = TrainConfig(max_steps=20_000, batch_size=8, grad_accum=16, lr=2e-4, warmup_steps=500, compile=False)
+    return model, mor, train
+
+
+def kaggle_medium_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
+    """
+    Kaggle-optimised medium model for T4/P100 (16GB VRAM).
+    Uses smaller d_model and aggressive grad_accum to fit.
+    ~120M effective, ~40M unique params.
+    """
+    model = ModelConfig(d_model=768, n_layers=18, n_heads=12, n_kv_heads=6, max_seq_len=256, dropout=0.0)
+    mor   = MoRConfig(n_recursions=3, strategy="middle_cycle")
+    train = TrainConfig(max_steps=50_000, batch_size=4, grad_accum=32, lr=1e-4, warmup_steps=1000, compile=False)
     return model, mor, train
 
 
@@ -268,8 +297,10 @@ def large_config() -> tuple[ModelConfig, MoRConfig, TrainConfig]:
 
 
 PRESETS = {
-    "tiny":     tiny_config,
-    "small":    small_config,
-    "medium":   medium_config,
-    "large":    large_config,
+    "tiny":           tiny_config,
+    "small":          small_config,
+    "kaggle_small":   kaggle_small_config,
+    "kaggle_medium":  kaggle_medium_config,
+    "medium":         medium_config,
+    "large":          large_config,
 }

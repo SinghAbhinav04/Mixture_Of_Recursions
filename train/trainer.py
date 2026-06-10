@@ -1,17 +1,17 @@
 """
 train/trainer.py
 ────────────────
-MoR-aware training loop.
+MoR-aware training loop with memory optimisations for constrained GPUs.
 
-Improvements over reference repo:
-  ① Single clean Python function — no HuggingFace Trainer subclass complexity
-  ② Proper logging of all loss components (lm_loss + aux_loss + z_loss)
-  ③ Gradient accumulation built-in
-  ④ Automatic mixed precision (bf16/fp16/fp32)
-  ⑤ Router stats logged (capacity, active tokens per step)
-  ⑥ Checkpoint saving with full recovery (model, optimizer, scheduler, step)
+Memory fixes vs original:
+  ① Dataset stays on CPU — only batches moved to GPU
+  ② torch.cuda.empty_cache() after eval / checkpoint
+  ③ Gradient checkpointing support (trades ~25% speed for ~60% activation mem)
+  ④ GPU memory tracking in logs
+  ⑤ Early OOM warning before training starts
 """
 from __future__ import annotations
+import gc
 import os
 import time
 from typing import Dict, Optional
@@ -47,6 +47,47 @@ class AverageMeter:
 
 
 # ─────────────────────────────────────────────────────────────────
+#  GPU Memory Utilities
+# ─────────────────────────────────────────────────────────────────
+
+def gpu_mem_used() -> float:
+    """Return GPU memory in use (GB) or 0 if no CUDA."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1e9
+    return 0.0
+
+
+def gpu_mem_reserved() -> float:
+    """Return GPU memory reserved by allocator (GB) or 0 if no CUDA."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_reserved() / 1e9
+    return 0.0
+
+
+def free_gpu_cache():
+    """Release cached GPU memory back to OS."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def estimate_peak_mem(model: MoRForCausalLM, batch_size: int, seq_len: int) -> float:
+    """
+    Rough estimate of peak GPU memory (GB) during training.
+    Helps warn users before OOM.
+    """
+    p = model.num_params()
+    param_gb = p["unique"] * 2 / 1e9           # bf16 params
+    optim_gb = p["unique"] * 8 / 1e9            # fp32 master + momentum + variance
+    grad_gb  = p["unique"] * 2 / 1e9            # bf16 grads
+    # Rough activation estimate: B * T * d * n_layers * 2 bytes * ~8 (residuals)
+    act_gb = batch_size * seq_len * model.model_cfg.d_model * model.model_cfg.n_layers * 16 / 1e9
+    # Logits: B * T * vocab * 2 bytes (bf16) — chunked CE avoids fp32 upcast
+    logits_gb = batch_size * seq_len * model.model_cfg.vocab_size * 2 / 1e9
+    return param_gb + optim_gb + grad_gb + act_gb + logits_gb
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Evaluation
 # ─────────────────────────────────────────────────────────────────
 
@@ -66,12 +107,13 @@ def evaluate(
         dict with 'val_loss', 'val_lm_loss', 'val_ppl' (perplexity)
     """
     model.eval()
-    lm_losses   = torch.zeros(eval_iters)
+    lm_losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
         x, y = get_batch(val_data, block_size, batch_size, device=device)
         out  = model(x, y)
         lm_losses[k] = out.lm_loss.item()
     model.train()
+    free_gpu_cache()
     avg_lm_loss = lm_losses.mean().item()
     return {
         "val_loss":    avg_lm_loss,
@@ -105,6 +147,7 @@ def save_checkpoint(
         "mor_cfg":             mor_cfg,
     }, path)
     print(f"  ✓ Checkpoint saved → {path}")
+    free_gpu_cache()
 
 
 def load_checkpoint(path: str, model: MoRForCausalLM, optimizer, scheduler):
@@ -129,12 +172,12 @@ def train(
     resume_from: Optional[str] = None,
 ) -> MoRForCausalLM:
     """
-    Full MoR training loop.
+    Full MoR training loop with memory optimisations.
 
     Args:
         model:       MoRForCausalLM instance (already moved to device)
-        train_data:  1D LongTensor of training token IDs
-        val_data:    1D LongTensor of validation token IDs
+        train_data:  1D LongTensor of training token IDs (CPU is fine)
+        val_data:    1D LongTensor of validation token IDs (CPU is fine)
         cfg:         TrainConfig
         resume_from: optional path to a checkpoint to resume from
 
@@ -146,16 +189,23 @@ def train(
                              "mps"  if torch.backends.mps.is_available() else "cpu")
     model = model.to(device)
 
+    # ── Early OOM warning ──
+    if device == "cuda":
+        total_vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        estimated = estimate_peak_mem(model, cfg.batch_size, model.model_cfg.max_seq_len)
+        if estimated > total_vram * 0.9:
+            print(f"\n  ⚠ WARNING: Estimated peak memory {estimated:.1f} GB "
+                  f"exceeds GPU VRAM {total_vram:.1f} GB!")
+            print(f"    → Try: --preset kaggle_small  OR  --batch_size 4 --grad_accum 32")
+            print(f"    → Or:  --gradient_checkpointing (already on by default)\n")
+
     # ── Mixed precision scaler ──
     use_amp   = cfg.precision in ("fp16", "bf16")
     amp_dtype = torch.bfloat16 if cfg.precision == "bf16" else torch.float16
 
-    # Version-compatible GradScaler initialization
     try:
-        # Modern PyTorch API
         scaler = torch.amp.GradScaler(device_type="cuda", enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
     except (TypeError, AttributeError):
-        # Fallback for older PyTorch versions (< 2.3)
         scaler = torch.cuda.amp.GradScaler(enabled=(cfg.precision == "fp16" and torch.cuda.is_available()))
 
     # ── Compile (PyTorch 2.0+) ──
@@ -164,7 +214,6 @@ def train(
         model = torch.compile(model)
 
     # ── Optimizer ──
-    # Separate weight decay: apply to weight matrices, not biases/norms
     decay_params = [p for n, p in model.named_parameters() if p.ndim >= 2]
     nodecay_params = [p for n, p in model.named_parameters() if p.ndim < 2]
     optimizer = torch.optim.AdamW(
@@ -174,7 +223,7 @@ def train(
         ],
         lr=cfg.lr,
         betas=(cfg.beta1, cfg.beta2),
-        fused=torch.cuda.is_available(),  # much faster on GPU
+        fused=torch.cuda.is_available(),
     )
 
     # ── Scheduler ──
@@ -203,6 +252,9 @@ def train(
     print(f"  Training Abhinav-MoR")
     print(f"  Device: {device}  |  Precision: {cfg.precision}")
     print(f"  Steps: {cfg.max_steps}  |  Batch: {cfg.batch_size}  |  Grad accum: {cfg.grad_accum}")
+    print(f"  Gradient checkpointing: {cfg.gradient_checkpointing}")
+    if device == "cuda":
+        print(f"  GPU VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
     print(f"{'='*60}\n")
 
     for step in range(start_step, cfg.max_steps):
@@ -222,13 +274,14 @@ def train(
             scaler.scale(loss).backward()
             total_loss += loss.detach()
 
-            # Accumulate metrics
             if out.lm_loss is not None:
                 meters["lm"].update(out.lm_loss.item())
             if out.aux_loss is not None:
                 meters["aux"].update(out.aux_loss.item())
             if out.z_loss is not None:
                 meters["z"].update(out.z_loss.item())
+
+            del out, loss
 
         # ── Gradient clip + update ──
         scaler.unscale_(optimizer)
@@ -238,12 +291,14 @@ def train(
 
         lr = scheduler.step()
         meters["total"].update(total_loss.item())
+        del total_loss
 
         # ── Logging ──
         if step % cfg.log_interval == 0:
             dt = time.time() - t0
             t0 = time.time()
             tokens_per_sec = (cfg.batch_size * block_size * cfg.grad_accum * cfg.log_interval) / dt
+            mem_str = f" | gpu {gpu_mem_used():.1f}/{gpu_mem_reserved():.1f} GB" if device == "cuda" else ""
             print(
                 f"step {step:6d} | "
                 f"loss {meters['total'].avg():.4f} | "
@@ -252,6 +307,7 @@ def train(
                 f"z {meters['z'].avg():.5f} | "
                 f"lr {lr:.2e} | "
                 f"tok/s {tokens_per_sec:,.0f}"
+                f"{mem_str}"
             )
             for m in meters.values():
                 m.reset()

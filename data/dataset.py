@@ -116,17 +116,19 @@ def get_dataset(
     """
     Load, tokenize, and split a dataset.
 
+    Data is kept on CPU to avoid GPU OOM. Batches are moved to GPU
+    in get_batch() instead.
+
     Args:
         source:      "tiny_shakespeare" | "fineweb" | "openwebtext" | /path/to/file.txt
         train_split: fraction of data for training (rest is validation)
         max_samples: limit number of samples (for HF datasets)
         cache_dir:   local cache directory
-        device:      torch device for tensors
+        device:      DEPRECATED — data is always kept on CPU
 
     Returns:
-        (train_data, val_data) — 1D LongTensors of token IDs
+        (train_data, val_data) — 1D LongTensors of token IDs (on CPU)
     """
-    # ── Load raw text ──
     if source == "tiny_shakespeare":
         text = _load_tiny_shakespeare(cache_dir)
     elif os.path.isfile(source):
@@ -136,7 +138,6 @@ def get_dataset(
 
     print(f"Dataset: {len(text):,} characters")
 
-    # ── Tokenise ──
     enc = get_tokenizer()
     print(f"Tokenising with tiktoken {enc.name} (vocab={enc.n_vocab:,})...")
     ids = enc.encode(text)
@@ -144,12 +145,11 @@ def get_dataset(
 
     print(f"Tokenised: {len(data):,} tokens")
 
-    # ── Train / val split ──
     n = int(train_split * len(data))
-    train_data = data[:n].to(device)
-    val_data   = data[n:].to(device)
+    train_data = data[:n]
+    val_data   = data[n:]
 
-    print(f"Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
+    print(f"Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens (CPU)")
     return train_data, val_data
 
 

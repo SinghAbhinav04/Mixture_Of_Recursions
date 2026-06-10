@@ -112,8 +112,8 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     model     = model.to(device)
 
-    # Load val data
-    _, val_data = get_dataset(args.dataset, device=device)
+    # Load val data (CPU; batches moved in get_batch)
+    _, val_data = get_dataset(args.dataset)
 
     # Evaluate
     results = evaluate_model(

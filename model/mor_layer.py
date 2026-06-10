@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import List, NamedTuple, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as cp
 
 from model.base import TransformerBlock
 from model.router import ExpertChoiceRouter, TokenChoiceRouter, RouterOutput
@@ -69,6 +70,7 @@ class ExpertChoiceMoRLayer(nn.Module):
         router: ExpertChoiceRouter,
         gating: str = "weighted",
         block_indices: Optional[List[int]] = None,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.blocks  = blocks
@@ -77,6 +79,7 @@ class ExpertChoiceMoRLayer(nn.Module):
         self.block_indices = block_indices
         self.is_mor  = True
         self.mor_type = "expert"
+        self.gradient_checkpointing = gradient_checkpointing
 
     def forward(
         self,
@@ -112,9 +115,14 @@ class ExpertChoiceMoRLayer(nn.Module):
         for i, block in enumerate(self.blocks):
             global_idx = self.block_indices[i] if self.block_indices is not None else i
             past_kv = kv_cache.get(global_idx, recursion_idx) if use_cache and kv_cache else None
-            
-            h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
-            
+
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h = cp.checkpoint(block, h, past_kv, use_cache, use_reentrant=False)
+                h = h[0] if isinstance(h, tuple) else h
+                new_kv = None
+            else:
+                h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
+
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 
@@ -161,6 +169,7 @@ class TokenChoiceMoRLayer(nn.Module):
         router: TokenChoiceRouter,
         gating: str = "weighted",
         block_indices: Optional[List[int]] = None,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.blocks   = blocks
@@ -169,6 +178,7 @@ class TokenChoiceMoRLayer(nn.Module):
         self.block_indices = block_indices
         self.is_mor   = True
         self.mor_type = "token"
+        self.gradient_checkpointing = gradient_checkpointing
 
     def forward(
         self,
@@ -203,9 +213,14 @@ class TokenChoiceMoRLayer(nn.Module):
         for i, block in enumerate(self.blocks):
             global_idx = self.block_indices[i] if self.block_indices is not None else i
             past_kv = kv_cache.get(global_idx, recursion_idx) if use_cache and kv_cache else None
-            
-            h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
-            
+
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h = cp.checkpoint(block, h, past_kv, use_cache, use_reentrant=False)
+                h = h[0] if isinstance(h, tuple) else h
+                new_kv = None
+            else:
+                h, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
+
             if use_cache and kv_cache and new_kv is not None:
                 kv_cache.update(global_idx, recursion_idx, new_kv[0], new_kv[1])
 

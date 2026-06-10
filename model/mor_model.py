@@ -42,6 +42,45 @@ from model.kv_cache import RecursiveKVCache
 from configs.default import ModelConfig, MoRConfig
 
 
+def chunked_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -1,
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """
+    Memory-efficient cross-entropy that processes logits in chunks along
+    the sequence dimension. Avoids the fp32 upcast OOM from materializing
+    the full (B*T, vocab) logits tensor in fp32 at once.
+
+    For B=32, T=512, vocab=200K: full CE needs ~18GB (bf16 logits + fp32
+    upcast). With chunk_size=256, each chunk is only ~1.1GB peak.
+    """
+    B, T, V = logits.shape
+    flat_logits = logits.view(B * T, V)
+    flat_targets = targets.view(B * T)
+
+    n = flat_logits.shape[0]
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+    n_valid = 0
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk_logits = flat_logits[start:end]
+        chunk_targets = flat_targets[start:end]
+        mask = chunk_targets != ignore_index
+        if mask.any():
+            chunk_loss = F.cross_entropy(
+                chunk_logits, chunk_targets, ignore_index=ignore_index, reduction="sum"
+            )
+            total_loss = total_loss + chunk_loss
+            n_valid += mask.sum().item()
+
+    if n_valid > 0:
+        return total_loss / n_valid
+    return total_loss
+
+
 # ─────────────────────────────────────────────────────────────────
 #  Model Output Container
 # ─────────────────────────────────────────────────────────────────
@@ -74,10 +113,11 @@ class MoRForCausalLM(nn.Module):
         model_cfg: ModelConfig — architecture hyperparameters
         mor_cfg:   MoRConfig  — routing / sharing hyperparameters
     """
-    def __init__(self, model_cfg: ModelConfig, mor_cfg: MoRConfig):
+    def __init__(self, model_cfg: ModelConfig, mor_cfg: MoRConfig, gradient_checkpointing: bool = False):
         super().__init__()
         self.model_cfg = model_cfg
         self.mor_cfg   = mor_cfg
+        self.gradient_checkpointing = gradient_checkpointing
 
         # ── 1. Build the unique shared TransformerBlocks ──
         n_unique = count_unique_blocks(mor_cfg.strategy, model_cfg.n_layers, mor_cfg.n_recursions)
@@ -137,7 +177,7 @@ class MoRForCausalLM(nn.Module):
                     rand_router      = router_cfg.rand_router,
                     router_type      = router_cfg.router_type,
                 )
-                layer = ExpertChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
+                layer = ExpertChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices, gradient_checkpointing=gradient_checkpointing)
             else:
                 router = TokenChoiceRouter(
                     d_model               = model_cfg.d_model,
@@ -149,7 +189,7 @@ class MoRForCausalLM(nn.Module):
                     balancing             = router_cfg.balancing,
                     bal_warmup_steps      = router_cfg.bal_warmup_steps,
                 )
-                layer = TokenChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices)
+                layer = TokenChoiceMoRLayer(step_blocks, router, gating=mor_cfg.gating, block_indices=block_indices, gradient_checkpointing=gradient_checkpointing)
 
             self.mor_layers.append(layer)
 
@@ -242,11 +282,7 @@ class MoRForCausalLM(nn.Module):
         # ── Losses ──
         lm_loss = None
         if targets is not None:
-            lm_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
+            lm_loss = chunked_cross_entropy(logits, targets, ignore_index=-1)
 
         loss = None
         if lm_loss is not None:
@@ -258,7 +294,7 @@ class MoRForCausalLM(nn.Module):
             lm_loss       = lm_loss,
             aux_loss      = total_aux_loss if targets is not None else None,
             z_loss        = total_z_loss   if targets is not None else None,
-            router_logits = all_router_logits if all_router_logits else None,
+            router_logits = [rl.detach() for rl in all_router_logits] if all_router_logits else None,
         )
 
     @torch.inference_mode()

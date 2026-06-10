@@ -234,10 +234,10 @@ class ExpertChoiceRouter(nn.Module):
             gate_values = raw_logits
 
         # ── Select top-k tokens by gate value ──
-        sel_vals, selected = torch.topk(gate_values, top_k, dim=1, sorted=False)   # (B, k, 1)
+        sel_vals, selected_unsorted = torch.topk(gate_values, top_k, dim=1, sorted=False)   # (B, k, 1)
 
         # Sort indices to maintain causal (positional) order — IMPORTANT for attention
-        selected, sort_order = torch.sort(selected, dim=1)
+        selected, sort_order = torch.sort(selected_unsorted, dim=1)
         gate_weights = torch.gather(sel_vals, dim=1, index=sort_order)
 
         # ── Map local indices back to full-sequence indices (hierarchical) ──
@@ -250,9 +250,9 @@ class ExpertChoiceRouter(nn.Module):
 
         if self.training and not self.rand_router:
             # Build targets: 1 for selected tokens, 0 for the rest
+            # Reuse the unsorted indices from the original topk (before sort + remap)
             targets = torch.zeros(B, T, 1, device=x.device, dtype=gate_values.dtype)
-            local_sel = torch.topk(gate_values, top_k, dim=1, sorted=False)[1]     # (B, k, 1)
-            targets.scatter_(1, local_sel, 1.0)
+            targets.scatter_(1, selected_unsorted, 1.0)
 
             if self.sampling == "aux_loss":
                 # BCE on raw router logits vs top-k binary mask
@@ -266,8 +266,9 @@ class ExpertChoiceRouter(nn.Module):
                 aux_loss   = self.aux_loss_weight * loss_raw / (B * T)
 
             # Z-loss: penalise large logits (Zoph et al., 2022)
+            # Detach to avoid anchoring the full router subgraph via z-loss backward
             if self.z_loss_weight > 0:
-                z = torch.logsumexp(raw_logits.squeeze(-1), dim=-1)    # (B,)
+                z = torch.logsumexp(raw_logits.detach().squeeze(-1), dim=-1)    # (B,)
                 z_loss = self.z_loss_weight * z.pow(2).mean()
 
         return RouterOutput(
